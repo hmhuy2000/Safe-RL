@@ -71,7 +71,6 @@ class CPOBuffer:
         # Center, but do NOT rescale advantages for cost gradient
         cadv_mean, _ = mpi_statistics_scalar(self.cadv_buf)
         self.cadv_buf -= cadv_mean
-
         return [self.obs_buf, self.act_buf, self.adv_buf,
                 self.cadv_buf, self.ret_buf, self.cret_buf,
                 self.logp_buf] + values_as_sorted_list(self.pi_info_bufs)

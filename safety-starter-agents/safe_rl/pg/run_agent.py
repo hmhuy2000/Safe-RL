@@ -3,18 +3,18 @@ import tensorflow as tf
 import gym
 import time
 import safe_rl.pg.trust_region as tro
-from safe_rl.pg.agents import PPOAgent, TRPOAgent, CPOAgent
+from safe_rl.pg.agents import PPOAgent
 from safe_rl.pg.buffer import CPOBuffer
 from safe_rl.pg.network import count_vars, \
                                get_vars, \
                                mlp_actor_critic,\
                                placeholders, \
-                               placeholders_from_spaces
+                               placeholders_from_spaces,mlp
 from safe_rl.pg.utils import values_as_sorted_list
 from safe_rl.utils.logx import EpochLogger
 from safe_rl.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
 from safe_rl.utils.mpi_tools import mpi_fork, proc_id, num_procs, mpi_sum
-
+from safe_rl.pg.utils import combined_shape, EPS
 # Multi-purpose agent runner for policy optimization algos 
 # (PPO, TRPO, their primal-dual equivalents, CPO)
 def run_polopt_agent(env_fn, 
@@ -37,9 +37,9 @@ def run_polopt_agent(env_fn,
                      # Cost constraints / penalties:
                      cost_lim=25,
                      penalty_init=1.,
-                     penalty_lr=5e-2,
+                     penalty_lr=1e-5,
                      # KL divergence:
-                     target_kl=0.01, 
+                     target_kl=0.05, 
                      # Value learning:
                      vf_lr=1e-3,
                      vf_iters=80, 
@@ -64,7 +64,7 @@ def run_polopt_agent(env_fn,
     env = env_fn()
 
     agent.set_logger(logger)
-
+    
     #=========================================================================#
     #  Create computation graph for actor and critic (not training routine)   #
     #=========================================================================#
@@ -80,7 +80,8 @@ def run_polopt_agent(env_fn,
 
     # Inputs to computation graph for special purposes
     surr_cost_rescale_ph = tf.placeholder(tf.float32, shape=())
-    cur_cost_ph = tf.placeholder(tf.float32, shape=())
+    # cur_cost_ph = tf.placeholder(tf.float32, shape=())
+    cur_cost_ph = tf.placeholder(dtype=tf.float32, shape=combined_shape(None,))
 
     # Outputs from actor critic
     ac_outs = actor_critic(x_ph, a_ph, **ac_kwargs)
@@ -135,28 +136,38 @@ def run_polopt_agent(env_fn,
     #=========================================================================#
 
     if agent.use_penalty:
-        with tf.variable_scope('penalty'):
-            # param_init = np.log(penalty_init)
-            param_init = np.log(max(np.exp(penalty_init)-1, 1e-8))
-            penalty_param = tf.get_variable('penalty_param',
-                                          initializer=float(param_init),
-                                          trainable=agent.learn_penalty,
-                                          dtype=tf.float32)
-        # penalty = tf.exp(penalty_param)
+        # with tf.variable_scope('penalty'):
+        #     # param_init = np.log(penalty_init)
+        #     param_init = np.log(max(np.exp(penalty_init)-1, 1e-8))
+        #     penalty_param = tf.get_variable('penalty_param',
+        #                                   initializer=float(param_init),
+        #                                   trainable=agent.learn_penalty,
+        #                                   dtype=tf.float32)
+        # penalty = tf.nn.softplus(penalty_param)
+
+        x_a = tf.concat([x_ph,a_ph],1)
+        with tf.variable_scope('penalty_val'):
+            penalty_param = tf.squeeze(mlp(x_a, list((256,256))+[1], tf.nn.relu, None), axis=1)
         penalty = tf.nn.softplus(penalty_param)
+
+    target_cost = (
+            cost_lim * (1 - gamma**max_ep_len) / (1 - gamma) / max_ep_len
+        )
+
 
     if agent.learn_penalty:
         if agent.penalty_param_loss:
-            penalty_loss = -penalty_param * (cur_cost_ph - cost_lim)
+            penalty_loss = -tf.reduce_mean(penalty * (cur_cost_ph - target_cost))
+            # penalty_loss = -penalty_param * (cur_cost_ph - cost_lim)
         else:
-            penalty_loss = -penalty * (cur_cost_ph - cost_lim)
+            raise
+            penalty_loss = tf.reduce_mean(-penalty * (cur_cost_ph - target_cost))
         train_penalty = MpiAdamOptimizer(learning_rate=penalty_lr).minimize(penalty_loss)
 
 
     #=========================================================================#
     #  Create computation graph for policy learning                           #
     #=========================================================================#
-
     # Likelihood ratio
     ratio = tf.exp(logp - logp_old_ph)
 
@@ -171,48 +182,24 @@ def run_polopt_agent(env_fn,
         surr_adv = tf.reduce_mean(ratio * adv_ph)
 
     # Surrogate cost
-    surr_cost = tf.reduce_mean(ratio * cadv_ph)
+    surr_cost = ratio * cadv_ph
 
     # Create policy objective function, including entropy regularization
     pi_objective = surr_adv + ent_reg * ent
 
     # Possibly include surr_cost in pi_objective
     if agent.objective_penalized:
-        pi_objective -= penalty * surr_cost
-        pi_objective /= (1 + penalty)
+        pi_objective -= tf.reduce_mean(tf.stop_gradient(penalty) * surr_cost)
+        pi_objective /= (1 + tf.reduce_mean(tf.stop_gradient(penalty)))
 
     # Loss function for pi is negative of pi_objective
     pi_loss = -pi_objective
 
     # Optimizer-specific symbols
-    if agent.trust_region:
 
-        # Symbols needed for CG solver for any trust region method
-        pi_params = get_vars('pi')
-        flat_g = tro.flat_grad(pi_loss, pi_params)
-        v_ph, hvp = tro.hessian_vector_product(d_kl, pi_params)
-        if agent.damping_coeff > 0:
-            hvp += agent.damping_coeff * v_ph
-
-        # Symbols needed for CG solver for CPO only
-        flat_b = tro.flat_grad(surr_cost, pi_params)
-
-        # Symbols for getting and setting params
-        get_pi_params = tro.flat_concat(pi_params)
-        set_pi_params = tro.assign_params_from_flat(v_ph, pi_params)
-
-        training_package = dict(flat_g=flat_g,
-                                flat_b=flat_b,
-                                v_ph=v_ph,
-                                hvp=hvp,
-                                get_pi_params=get_pi_params,
-                                set_pi_params=set_pi_params)
-
-    elif agent.first_order:
-
+    if agent.first_order:
         # Optimizer for first-order policy optimization
         train_pi = MpiAdamOptimizer(learning_rate=agent.pi_lr).minimize(pi_loss)
-
         # Prepare training package for agent
         training_package = dict(train_pi=train_pi)
 
@@ -270,7 +257,7 @@ def run_polopt_agent(env_fn,
     #  Create function for running update (called at end of each epoch)       #
     #=========================================================================#
 
-    def update():
+    def update(ep):
         cur_cost = logger.get_stats('EpCost')[0]
         c = cur_cost - cost_lim
         if c > 0 and agent.cares_about_cost:
@@ -279,10 +266,11 @@ def run_polopt_agent(env_fn,
         #=====================================================================#
         #  Prepare feed dict                                                  #
         #=====================================================================#
-
-        inputs = {k:v for k,v in zip(buf_phs, buf.get())}
+        tmp = buf.get()
+        cost_return = tmp[5]
+        inputs = {k:v for k,v in zip(buf_phs, tmp)}
         inputs[surr_cost_rescale_ph] = logger.get_stats('EpLen')[0]
-        inputs[cur_cost_ph] = cur_cost
+        inputs[cur_cost_ph] = cost_return#cur_cost
 
         #=====================================================================#
         #  Make some measurements before updating                             #
@@ -299,12 +287,16 @@ def run_polopt_agent(env_fn,
 
         pre_update_measures = sess.run(measures, feed_dict=inputs)
         logger.store(**pre_update_measures)
+        print(logger.get_stats('EpCost'),logger.get_stats('EpRet'))
+        print('cost function:',np.mean(cost_return),np.max(cost_return),np.min(cost_return),target_cost)
+        # print('penalty:',np.mean(pre_update_measures['Penalty']),np.max(pre_update_measures['Penalty']),np.min(pre_update_measures['Penalty']))
+
 
         #=====================================================================#
-        #  Update penalty if learning penalty                                 #
+        #  Update value function                                              #
         #=====================================================================#
-        if agent.learn_penalty:
-            sess.run(train_penalty, feed_dict={cur_cost_ph: cur_cost})
+        for _ in range(vf_iters):
+            sess.run(train_vf, feed_dict=inputs)
 
         #=====================================================================#
         #  Update policy                                                      #
@@ -312,10 +304,24 @@ def run_polopt_agent(env_fn,
         agent.update_pi(inputs)
 
         #=====================================================================#
-        #  Update value function                                              #
+        #  Update penalty if learning penalty                                 #
         #=====================================================================#
-        for _ in range(vf_iters):
-            sess.run(train_vf, feed_dict=inputs)
+
+        if agent.learn_penalty:
+            if (ep<25 or ep%5 == 0):
+                for iter in range(10):
+                    x = sess.run([train_penalty,penalty,penalty_loss], feed_dict={cur_cost_ph: cost_return
+                                    ,x_ph:tmp[0], a_ph:tmp[1]
+                                                        })
+                    # if (iter == 0):
+                    #     old_pen = np.asarray(x[1])
+                    # if (ep>25):
+                    #     if (np.mean(np.abs((np.asarray(x[1])-old_pen)/old_pen))>0.05):
+                    #         print(f'cut off penalty update at {iter}')
+                    #         break
+                print(f'penalty:',np.mean(x[1]),np.max(x[1]),np.min(x[1]),x[2])
+            print('cost value - target:',np.mean(cost_return-target_cost),np.max(cost_return-target_cost),np.min(cost_return-target_cost))
+
 
         #=====================================================================#
         #  Make some measurements after updating                              #
@@ -340,13 +346,13 @@ def run_polopt_agent(env_fn,
 
     start_time = time.time()
     o, r, d, c, ep_ret, ep_cost, ep_len = env.reset(), 0, False, 0, 0, 0, 0
-    cur_penalty = 0
+    # cur_penalty = 0
     cum_cost = 0
 
     for epoch in range(epochs):
 
-        if agent.use_penalty:
-            cur_penalty = sess.run(penalty)
+        # if agent.use_penalty:
+        #     cur_penalty = sess.run(penalty)
 
         for t in range(local_steps_per_epoch):
 
@@ -373,12 +379,7 @@ def run_polopt_agent(env_fn,
             cum_cost += c
 
             # save and log
-            if agent.reward_penalized:
-                r_total = r - cur_penalty * c
-                r_total = r_total / (1 + cur_penalty)
-                buf.store(o, a, r_total, v_t, 0, 0, logp_t, pi_info_t)
-            else:
-                buf.store(o, a, r, v_t, c, vc_t, logp_t, pi_info_t)
+            buf.store(o, a, r, v_t, c, vc_t, logp_t, pi_info_t)
             logger.store(VVals=v_t, CostVVals=vc_t)
 
             o = o2
@@ -418,7 +419,7 @@ def run_polopt_agent(env_fn,
         #=====================================================================#
         #  Run RL update                                                      #
         #=====================================================================#
-        update()
+        update(ep=epoch)
 
         #=====================================================================#
         #  Cumulative cost calculations                                       #
@@ -480,74 +481,3 @@ def run_polopt_agent(env_fn,
 
         # Show results!
         logger.dump_tabular()
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--agent', type=str, default='ppo')
-    parser.add_argument('--env', type=str, default='Safexp-PointGoal1-v0')
-    parser.add_argument('--hid', type=int, default=64)
-    parser.add_argument('--l', type=int, default=2)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--cost_gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--len', type=int, default=1000)
-    parser.add_argument('--cost_lim', type=float, default=10)
-    parser.add_argument('--exp_name', type=str, default='runagent')
-    parser.add_argument('--kl', type=float, default=0.01)
-    parser.add_argument('--render', action='store_true')
-    parser.add_argument('--reward_penalized', action='store_true')
-    parser.add_argument('--objective_penalized', action='store_true')
-    parser.add_argument('--learn_penalty', action='store_true')
-    parser.add_argument('--penalty_param_loss', action='store_true')
-    parser.add_argument('--entreg', type=float, default=0.)
-    args = parser.parse_args()
-
-    try:
-        import safety_gym
-    except:
-        print('Make sure to install Safety Gym to use constrained RL environments.')
-
-    mpi_fork(args.cpu)  # run parallel code with mpi
-
-    # Prepare logger
-    from safe_rl.utils.run_utils import setup_logger_kwargs
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-
-    # Prepare agent
-    agent_kwargs = dict(reward_penalized=args.reward_penalized,
-                        objective_penalized=args.objective_penalized,
-                        learn_penalty=args.learn_penalty,
-                        penalty_param_loss=args.penalty_param_loss)
-    if args.agent=='ppo':
-        agent = PPOAgent(**agent_kwargs)
-    elif args.agent=='trpo':
-        agent = TRPOAgent(**agent_kwargs)
-    elif args.agent=='cpo':
-        agent = CPOAgent(**agent_kwargs)
-
-    run_polopt_agent(lambda : gym.make(args.env),
-                     agent=agent,
-                     actor_critic=mlp_actor_critic,
-                     ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
-                     seed=args.seed, 
-                     render=args.render, 
-                     # Experience collection:
-                     steps_per_epoch=args.steps, 
-                     epochs=args.epochs,
-                     max_ep_len=args.len,
-                     # Discount factors:
-                     gamma=args.gamma,
-                     cost_gamma=args.cost_gamma,
-                     # Policy learning:
-                     ent_reg=args.entreg,
-                     # KL Divergence:
-                     target_kl=args.kl,
-                     cost_lim=args.cost_lim, 
-                     # Logging:
-                     logger_kwargs=logger_kwargs,
-                     save_freq=1
-                     )

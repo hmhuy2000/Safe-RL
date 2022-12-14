@@ -19,5 +19,6 @@ setup(
         'numpy',
         'seaborn==0.8.1',
         'tensorflow==1.15',
+        'protobuf==3.20.*'
     ],
 )

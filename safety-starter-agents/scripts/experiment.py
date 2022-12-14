@@ -26,7 +26,7 @@ def main(robot, task, algo, seed, exp_name, cpu):
         num_steps = 1e8
         steps_per_epoch = 60000
     else:
-        num_steps = 1e7
+        num_steps = 2e7
         steps_per_epoch = 30000
     epochs = int(num_steps / steps_per_epoch)
     save_freq = 50
