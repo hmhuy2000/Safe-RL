@@ -271,7 +271,11 @@ def main():
     parser.add_argument('logdir', nargs='*')
     parser.add_argument('--legend', '-l', nargs='*')
     parser.add_argument('--xaxis', '-x', default='TotalEnvInteracts')
-    parser.add_argument('--value', '-y', default=['Performance','AverageEpCost','Penalty'], nargs='*')
+    parser.add_argument('--value', '-y', default=[
+        'AverageEpRet',
+        'AverageEpCost',
+        'Averagefailure_rate'
+        ], nargs='*')
     parser.add_argument('--count', action='store_true')
     parser.add_argument('--smooth', '-s', type=int, default=1)
     parser.add_argument('--select', nargs='*')

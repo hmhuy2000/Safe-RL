@@ -312,6 +312,10 @@ class EpochLogger(Logger):
             average_only (bool): If true, do not log the standard deviation
                 of the diagnostic over the epoch.
         """
+        mean_val = None
+        std_val = None
+        max_val = None
+        min_val = None
         if val is not None:
             super().log_tabular(key,val)
         else:
@@ -319,12 +323,17 @@ class EpochLogger(Logger):
             vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = mpi_statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            mean_val = stats[0]
             if not(average_only):
                 super().log_tabular('Std'+key, stats[1])
+                std_val = stats[1]
             if with_min_and_max:
                 super().log_tabular('Max'+key, stats[3])
+                max_val = stats[3]
                 super().log_tabular('Min'+key, stats[2])
+                min_val = stats[2]
         self.epoch_dict[key] = []
+        return mean_val,std_val,max_val,min_val
 
     def get_stats(self, key):
         """
